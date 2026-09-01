@@ -33,22 +33,58 @@ behavior. Physical-device testing is required regardless of framework.
 race.** When a screen appears, TalkBack picks a default focus target itself
 (often the first focusable element, or a toolbar button) — frequently *before*
 your own code gets a chance to request focus on the element that actually
-matters. Fix pattern:
-1. Request focus on the intended element via `FocusRequester`, with a short
-   delayed fallback (e.g. `delay(600)`) in case nothing else claims focus at
-   all (no screen reader running).
-2. Install a `View.AccessibilityDelegate` on the parent view that listens for
-   `AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED`. If TalkBack's own
-   focus lands somewhere other than your intended target, immediately steal it
-   back with `focusRequester.requestFocus()` — don't just wait out a fixed
-   delay, since window-creation overhead makes timing unpredictable on cold
-   start.
-3. **Re-arm this on every `ON_RESUME`, not just once.** An Activity is not torn
-   down when merely backgrounded, so a one-shot `LaunchedEffect(Unit)` won't
-   rerun when the user returns to the app — TalkBack's default focus wins every
-   time it returns to the foreground unless you explicitly reclaim it again.
-   (iOS mirror: reset VoiceOver focus on every `scenePhase` return to
-   `.active`, not just on first appear.)
+matters. In Uptimer this showed up concretely as: a countdown/stopwatch screen
+appears, TalkBack lands on the elapsed-time text (the first focusable node),
+and because that text's spoken value changes every second, TalkBack narrates
+the running count out loud, unprompted.
+
+**The fix that actually works, confirmed on-device (Pixel 10 Pro, real
+TalkBack): `Modifier.semantics { traversalIndex = ... }` on the sibling
+nodes**, not a `FocusRequester`/`AccessibilityDelegate` chase. TalkBack's
+"what gets focus when this screen appears" choice is driven by the semantics
+tree's traversal order, independent of visual layout order — so put a lower
+`traversalIndex` on the control that should get initial focus (e.g. `-1f` on
+a Stop/Pause button) and a higher one on the element that should *not* (e.g.
+`1f` on the ticking elapsed-time text), even though the text is drawn above
+the button on screen:
+
+```kotlin
+Text(
+    text = formatElapsed(elapsed),
+    modifier = Modifier.semantics {
+        contentDescription = elapsedSpoken
+        traversalIndex = 1f   // visited/focused after the button below, despite being drawn first
+    }
+)
+// ...
+Button(
+    onClick = onStop,
+    modifier = Modifier.semantics { traversalIndex = -1f }  // gets initial focus
+) { Text("Stop") }
+```
+
+**A previously-documented approach here — installing a `View.AccessibilityDelegate`
+on the parent view to listen for `AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED`
+and steal focus back — was tried and confirmed NOT to work** (built, compiled
+cleanly, looked textbook-correct, had zero effect on-device: TalkBack kept
+narrating the elapsed text regardless). Reasonable guess at why: Compose's
+virtual accessibility nodes don't necessarily route through the real-View
+`requestSendAccessibilityEvent` bubbling chain the same way genuine child
+Views do, so a delegate on the ComposeView's parent may just never see the
+event it's listening for. Unconfirmed — but confirmed *not working* either
+way, so don't reach for it; use `traversalIndex` instead. A plain
+`FocusRequester.requestFocus()` (with a short delayed fallback, e.g.
+`delay(600)`, in case nothing else claims focus at all) is still worth keeping
+alongside `traversalIndex` as a minor nicety for keyboard/switch-access
+navigation, but it does not reliably move TalkBack's *spoken* cursor for touch
+users by itself — don't rely on it alone for that.
+
+**Re-arm/re-check on every `ON_RESUME`, not just once.** An Activity is not torn
+down when merely backgrounded, so a one-shot `LaunchedEffect(Unit)` won't
+rerun when the user returns to the app — verify focus behavior still holds
+every time a screen returns to the foreground, not just on first appearance.
+(iOS mirror: reset VoiceOver focus on every `scenePhase` return to `.active`,
+not just on first appear.)
 
 **Headings.** Compose exposes *nothing* as a heading by default — TalkBack's
 "jump by heading" navigation control only works on elements explicitly marked
@@ -362,10 +398,15 @@ this explicitly for anything that must fire while the screen is off or locked.
   but it has real, known blind spots for how Compose's merged-semantics nodes
   get represented — it is not a substitute for an actual TalkBack pass, only a
   cheap early filter.
-- Re-verify accessibility-sensitive Compose internals (like relying on
-  `AndroidComposeView`'s specific `AccessibilityDelegate` wiring) after any
-  Compose BOM bump — some of these patterns are observed behavior, not a
-  documented API contract, and can change silently.
+- Re-verify accessibility-sensitive Compose internals after any Compose BOM
+  bump — some of these patterns (like `traversalIndex` governing TalkBack's
+  default-focus choice) are observed behavior, not a documented API contract,
+  and can change silently. Prefer documented semantics properties
+  (`traversalIndex`, `heading()`, `liveRegion`, ...) over reaching into
+  `AndroidComposeView`'s internal View-level `AccessibilityDelegate` wiring —
+  the latter was tried for initial-focus control in Uptimer and confirmed not
+  to work at all, likely because Compose's virtual accessibility nodes don't
+  route through the real-View event-bubbling chain that hook expects.
 
 ## Quick pre-ship checklist
 
@@ -386,8 +427,9 @@ this explicitly for anything that must fire while the screen is off or locked.
       "clear on first focus" (not select-on-focus) for pre-filled examples.
 - [ ] Nothing dismisses the keyboard via `FocusManager.clearFocus()`.
 - [ ] Section labels are marked as headings; the initial and post-resume
-      accessibility focus target is deliberate, not whatever TalkBack defaults
-      to.
+      accessibility focus target is deliberate (via `traversalIndex` on the
+      relevant siblings, not a `View.AccessibilityDelegate` hack), not
+      whatever TalkBack defaults to.
 - [ ] Live-updating text splits label (`contentDescription`) from value
       (`stateDescription`), and fast/noisy values are thresholded or
       deliberately excluded from a live region.
