@@ -21,6 +21,9 @@ not a generic accessibility tutorial. It covers things like:
   not a duration — and the fix
 - Merged semantics for toggle rows, text field pitfalls (multi-line-by-default, the
   select-vs-clear-on-focus race), live-region chatter, and more
+- Why a delete custom action can silently repeat on the *next* item if its element gets
+  re-purposed - the same long-standing bug behind Apple Mail's rotor complaints, on both
+  VoiceOver and TalkBack, and the redesign (not a focus-reset hack) that actually fixes it
 
 ## Using this as a Claude Code skill
 

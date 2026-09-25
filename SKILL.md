@@ -79,6 +79,35 @@ alongside `traversalIndex` as a minor nicety for keyboard/switch-access
 navigation, but it does not reliably move TalkBack's *spoken* cursor for touch
 users by itself — don't rely on it alone for that.
 
+**Moving focus *later*, in response to an event on an already-visible screen,
+is a different problem from initial focus — `traversalIndex` doesn't apply
+(there's no re-entry to re-sort), and neither does `FocusRequester` alone, for
+the same reason as above.** Confirmed on-device (Pixel, real TalkBack, in
+Memorecorder): the actually-working technique is the `focused` semantics
+property, which sends `ACTION_ACCESSIBILITY_FOCUS` directly:
+
+```kotlin
+var isNextButtonFocused by remember { mutableStateOf(false) }
+// Reset back to false once applied, so setting it true again later
+// (e.g. the same event firing twice) still triggers a change.
+LaunchedEffect(isNextButtonFocused) {
+    if (isNextButtonFocused) isNextButtonFocused = false
+}
+
+Button(
+    onClick = { presenter.onSomeDestructiveAction(); isNextButtonFocused = true },
+    modifier = Modifier.semantics { focused = isNextButtonFocused }
+        .combinedClickable(...) // the focusability-applying modifier
+) { ... }
+```
+
+Ordering matters: the `semantics { focused = ... }` modifier has to sit
+*before* (to the left of, i.e. wrapping outside) the modifier that actually
+makes the element focusable/clickable (`combinedClickable`/`toggleable`/
+`clickable`) - putting it after had no effect. iOS/SwiftUI equivalent:
+`@AccessibilityFocusState`, which doesn't need the manual reset-to-false dance
+(setting it directly re-triggers a fresh arrival each time).
+
 **Re-arm/re-check on every `ON_RESUME`, not just once.** An Activity is not torn
 down when merely backgrounded, so a one-shot `LaunchedEffect(Unit)` won't
 rerun when the user returns to the app — verify focus behavior still holds
@@ -255,6 +284,49 @@ double-tap-and-hold, so "long-press previous/next to jump to first/last" works
 for touch and screen-reader users with the same one interaction, no separate
 button needed.
 
+## A destructive custom action can linger selected on the *next* element too
+
+If a custom action deletes/removes the current item and a *different* item
+then takes over the same visible control (e.g. a single play/pause button
+whose "current item" pointer moves to the next one, rather than a scrolling
+list), a **second, unrelated double-tap right after the first can silently
+repeat the destructive action on the new item** — confirmed independently on
+both platforms, in Memorecorder:
+
+- **iOS/VoiceOver**: reported live by a blind user — delete a memo via the
+  "Verwijder" (Delete) item on the Actions rotor, then double-tap again
+  (meaning to hear what's next) — it deletes the *next* memo too.
+- **Android/TalkBack**: same root cause, same fix, confirmed separately on a
+  real device.
+
+This turns out to be the same long-standing, still-unresolved platform bug
+users have reported for years in Apple's own Mail app (see AppleVis and Mosen
+At Large's coverage, going back to iOS 11, still present in iOS 17.1): the
+screen reader's rotor/local-context-menu only forgets a selected custom action
+when focus moves to a genuinely *different kind* of element — not between two
+elements of the same shape (message-to-message in Mail; the same button
+re-purposed for the next item here). **Don't spend more than one or two
+attempts trying to force a reset of that selection from app code** —
+`UIAccessibility.post(.screenChanged)`, toggling `@AccessibilityFocusState`
+false-then-true on the *same* element, and hopping focus through a different
+element and back to the *same* one were all tried and confirmed **not** to
+fix it. If even Apple's own team hasn't reliably fixed this in their own app
+across many iOS versions, treat it as a platform limitation to design around,
+not a bug to patch.
+
+**The fix that actually worked: redesign the interaction so the stale
+selection can't matter, rather than trying to reset it.**
+1. Make the destructive action's own handler complete a safe follow-up
+   itself (e.g. auto-play the item that becomes current), removing the
+   user's reason to interact again immediately at all.
+2. Move accessibility focus, after the fact, to a genuinely *different*,
+   non-destructive element and *leave it there* (no hop back) — see "Moving
+   focus later" under Focus management above for the actual mechanism per
+   platform (`@AccessibilityFocusState` on iOS, `semantics { focused = ... }`
+   on Android). A stray extra double-tap then lands somewhere that can't
+   delete anything, regardless of what the rotor/local-context-menu still
+   thinks is selected.
+
 ## Text input pitfalls (numeric fields especially)
 
 - **`OutlinedTextField`/`BasicTextField` default to multi-line.** Without
@@ -430,6 +502,11 @@ this explicitly for anything that must fire while the screen is off or locked.
       accessibility focus target is deliberate (via `traversalIndex` on the
       relevant siblings, not a `View.AccessibilityDelegate` hack), not
       whatever TalkBack defaults to.
+- [ ] Any destructive custom action (delete, remove) whose element gets
+      re-purposed for a different item afterward either auto-completes a safe
+      follow-up itself, or moves accessibility focus away to a
+      non-destructive element - not left for a stray extra double-tap to
+      possibly repeat.
 - [ ] Live-updating text splits label (`contentDescription`) from value
       (`stateDescription`), and fast/noisy values are thresholded or
       deliberately excluded from a live region.
